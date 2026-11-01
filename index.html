@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Phone Mount - Streamer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            font-family: Arial, sans-serif;
+            color: white;
+            overflow: hidden;
+        }
+        #status {
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            padding: 10px;
+            background: rgba(0,0,0,0.6);
+            font-size: 14px;
+            text-align: center;
+            z-index: 10;
+        }
+        video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+        }
+        #startBtn {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 20px 40px;
+            font-size: 18px;
+            z-index: 20;
+        }
+
+        /* Primary/backup signaling-server toggle - top right, out of the
+           way of the status bar. Tapping it swaps Singapore <-> Ohio.
+           Matches the same toggle on the viewer page so both ends always
+           agree on which server they're pointed at. */
+        #btnServer {
+            position: fixed;
+            top: 40px;
+            right: 8px;
+            z-index: 27;
+            padding: 6px 10px;
+            font-size: 11px;
+            background: rgba(0,0,0,0.6);
+            color: #3aa0ff;
+            border: 1px solid #3aa0ff;
+            border-radius: 999px;
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        #btnServer:active { background: rgba(58,160,255,0.35); }
+
+        /* USB connect toggle - directly below the server toggle, same
+           pill style. Turns green while a serial port is actually open. */
+        #btnUsb {
+            position: fixed;
+            top: 76px;
+            right: 8px;
+            z-index: 27;
+            padding: 6px 10px;
+            font-size: 11px;
+            background: rgba(0,0,0,0.6);
+            color: #3aa0ff;
+            border: 1px solid #3aa0ff;
+            border-radius: 999px;
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        #btnUsb.connected {
+            color: #3aff7a;
+            border-color: #3aff7a;
+        }
+        #btnUsb:active { background: rgba(58,160,255,0.35); }
+
+        /* USB connection log - small scrollable panel, off by default so
+           it doesn't clutter the camera preview during normal use. */
+        #usbLog {
+            position: fixed;
+            top: 108px;
+            right: 8px;
+            width: 220px;
+            max-height: 160px;
+            overflow-y: auto;
+            background: rgba(0,0,0,0.65);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 10px;
+            line-height: 1.4;
+            padding: 6px;
+            z-index: 26;
+            display: none;
+        }
+        #usbLog.visible { display: block; }
+        #usbLog div { white-space: pre-wrap; word-break: break-all; }
+    </style>
+</head>
+<body>
+
+<div id="status">Not started</div>
+<video id="localVideo" autoplay playsinline muted></video>
+<button id="startBtn" onclick="start()">Start Streaming</button>
+<button id="btnServer" title="Switch signaling server (Singapore/Ohio)"></button>
+<button id="btnUsb" title="Connect ESP32 via USB-OTG cable">Connect USB</button>
+<div id="usbLog"></div>
+
+<script>
+// ---- CONFIG: two signaling servers, with a manual toggle between them ----
+// PRIMARY = Singapore (closer to India -> lower latency). BACKUP = the
+// original Ohio service, kept only as a fallback if Singapore is ever
+// down/redeploying. Whichever one is picked is remembered in this
+// browser (localStorage) so it survives a reload instead of resetting
+// to primary every time. Everything else (the actual signaling URL)
+// still comes from that chosen server's own /config endpoint - see
+// .env.example on the server. MQTT credentials never reach this page.
+//
+// IMPORTANT: the streamer (this page) and the viewer must be switched
+// to the SAME server to find each other - they only meet at whichever
+// server's /config + WebSocket they're both connected to.
+const SIGNALING_SERVERS = {
+    primary: "https://signaling-2.onrender.com",     // Singapore
+    backup:  "https://signaling-5qj5.onrender.com",  // Ohio
+};
+let activeServer = localStorage.getItem("signalingServerChoice") || "primary";
+if (!SIGNALING_SERVERS[activeServer]) activeServer = "primary"; // guard against a stale/bad stored value
+let CONFIG_SOURCE = SIGNALING_SERVERS[activeServer];
+const ROOM_ID = "default";
+
+const btnServerEl = document.getElementById("btnServer");
+function refreshServerButton() {
+    if (!btnServerEl) return;
+    btnServerEl.textContent = activeServer === "primary" ? "SG (primary)" : "OH (backup)";
+}
+function switchSignalingServer() {
+    activeServer = activeServer === "primary" ? "backup" : "primary";
+    localStorage.setItem("signalingServerChoice", activeServer);
+    // Simplest reliable way to fully reconnect against the newly chosen
+    // server, rather than trying to tear down and rebuild everything
+    // (camera stream, WebSocket, peer connection) in place.
+    location.reload();
+}
+if (btnServerEl) {
+    refreshServerButton();
+    btnServerEl.addEventListener("click", switchSignalingServer);
+}
+
+let SIGNALING_URL = null;
+
+const statusEl = document.getElementById("status");
+const videoEl = document.getElementById("localVideo");
+const startBtn = document.getElementById("startBtn");
+
+let ws = null;
+let pc = null;
+let localStream = null;
+let currentFacingMode = "environment"; // rear camera to start, matches ESP32's default pan=90
+let cameraSwitchInProgress = false;
+let pendingFacingMode = null; // coalesces rapid-fire switch requests into just the latest one
+
+const VIDEO_CONSTRAINTS_BASE = {
+    width: { min: 960, ideal: 1920 },
+    height: { min: 540, ideal: 1080 },
+    frameRate: { ideal: 30, max: 30 }
+};
+
+const BITRATE_TARGET = 2_500_000; // 2.5 Mbps, see note in createPeerConnection
+
+async function loadConfig() {
+    const res = await fetch(CONFIG_SOURCE + "/config");
+    const config = await res.json();
+    SIGNALING_URL = config.signalingUrl;
+    if (!SIGNALING_URL) {
+        throw new Error("Server returned no signalingUrl - check SIGNALING_URL env var on the server");
+    }
+}
+
+const ICE_SERVERS = [
+    { urls: "stun:stun.l.google.com:19302" },
+    {
+        urls: "turn:openrelay.metered.ca:80",
+        username: "openrelayproject",
+        credential: "openrelayproject"
+    },
+    {
+        urls: "turn:openrelay.metered.ca:443",
+        username: "openrelayproject",
+        credential: "openrelayproject"
+    },
+    {
+        urls: "turn:openrelay.metered.ca:443?transport=tcp",
+        username: "openrelayproject",
+        credential: "openrelayproject"
+    }
+];
+
+function setStatus(text) {
+    statusEl.textContent = text;
+    console.log("[status]", text);
+}
+
+async function start() {
+    startBtn.style.display = "none";
+    setStatus("Loading config...");
+
+    try {
+        await loadConfig();
+    } catch (err) {
+        setStatus("Config load failed: " + err.message);
+        return;
+    }
+
+    setStatus("Requesting camera...");
+
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: currentFacingMode, ...VIDEO_CONSTRAINTS_BASE },
+            audio: true
+        });
+        videoEl.srcObject = localStream;
+    } catch (err) {
+        setStatus("Camera access failed: " + err.message);
+        return;
+    }
+
+    connectSignaling();
+}
+
+function connectSignaling() {
+    setStatus("Connecting to signaling server...");
+    ws = new WebSocket(SIGNALING_URL);
+
+    ws.onopen = () => {
+        setStatus("Connected. Waiting for viewer...");
+        ws.send(JSON.stringify({ type: "register", role: "streamer", room: ROOM_ID }));
+    };
+
+    ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === "viewer-ready") {
+            await createPeerConnection();
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: "offer", room: ROOM_ID, sdp: offer }));
+            setStatus("Offer sent. Negotiating...");
+
+        } else if (msg.type === "answer") {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            setStatus("Connected to viewer!");
+
+        } else if (msg.type === "ice-candidate") {
+            if (msg.candidate) {
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                } catch (e) {
+                    console.error("Error adding ICE candidate", e);
+                }
+            }
+
+        } else if (msg.type === "peer-disconnected") {
+            setStatus("Viewer disconnected. Waiting for a new viewer...");
+            if (pc) { pc.close(); pc = null; }
+
+        } else if (msg.type === "switch-camera") {
+            // The viewer tapped the manual flip-camera button. Hot-swap
+            // the video track without renegotiating the whole connection.
+            // This is fully independent of pan/tilt - the servo angle is
+            // untouched by a flip.
+            await switchCamera(msg.facingMode);
+
+        } else if (msg.type === "usb-command") {
+            // server.js is routing a pan/tilt/stop command to us because
+            // this room is currently in USB mode - write it straight down
+            // the OTG cable instead of anything going over the air.
+            writeToUsb(msg.payload);
+        }
+    };
+
+    ws.onclose = () => {
+        setStatus("Signaling disconnected. Retrying in 3s...");
+        setTimeout(connectSignaling, 3000);
+    };
+
+    ws.onerror = (err) => {
+        console.error("WebSocket error", err);
+    };
+}
+
+// Public entry point: coalesces rapid-fire switch requests (e.g. from a
+// server that's flipping quickly) into just the latest desired camera,
+// instead of firing overlapping getUserMedia calls. Overlapping calls are
+// exactly what causes "Could not start video source" - the hardware
+// hasn't finished releasing the previous camera yet.
+async function switchCamera(facingMode) {
+    if (facingMode === currentFacingMode) return; // already there, nothing to do
+
+    if (cameraSwitchInProgress) {
+        pendingFacingMode = facingMode; // remember the latest request, apply it after
+        return;
+    }
+
+    cameraSwitchInProgress = true;
+    try {
+        await performCameraSwitch(facingMode);
+    } finally {
+        cameraSwitchInProgress = false;
+    }
+
+    if (pendingFacingMode !== null && pendingFacingMode !== currentFacingMode) {
+        const next = pendingFacingMode;
+        pendingFacingMode = null;
+        await switchCamera(next);
+    } else {
+        pendingFacingMode = null;
+    }
+}
+
+// Swaps to the other physical camera (front/rear) and replaces the track
+// on the existing peer connection, so the viewer sees the new camera
+// without any renegotiation delay or connection drop.
+async function performCameraSwitch(facingMode) {
+    if (!localStream) return; // not streaming yet - nothing to swap
+
+    setStatus(`Switching to ${facingMode === "user" ? "front" : "rear"} camera...`);
+
+    // Stop and remove the OLD track first. Most phones only allow one
+    // camera stream open at a time - if the old track is still active
+    // when we request the new one, getUserMedia fails with
+    // "Could not start video source" because the hardware is busy.
+    const oldVideoTrack = localStream.getVideoTracks()[0];
+    if (oldVideoTrack) {
+        localStream.removeTrack(oldVideoTrack);
+        oldVideoTrack.stop();
+    }
+
+    let newStream;
+    try {
+        newStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: facingMode, ...VIDEO_CONSTRAINTS_BASE },
+            audio: false // keep the existing audio track - only swap video
+        });
+    } catch (err) {
+        console.error("Camera switch failed:", err.message);
+        setStatus("Camera switch failed: " + err.message + " - reverting to previous camera");
+
+        // We already stopped the old track, so the stream currently has no
+        // video. Try to reacquire the PREVIOUS camera rather than leaving
+        // the viewer with a frozen/blank feed.
+        try {
+            const fallbackStream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: currentFacingMode, ...VIDEO_CONSTRAINTS_BASE },
+                audio: false
+            });
+            const fallbackTrack = fallbackStream.getVideoTracks()[0];
+            if (pc) {
+                const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+                if (sender) {
+                    await sender.replaceTrack(fallbackTrack);
+                    applyEncodingHints(sender, fallbackTrack);
+                }
+            }
+            localStream.addTrack(fallbackTrack);
+            videoEl.srcObject = localStream;
+            setStatus(`Live (${currentFacingMode === "user" ? "front" : "rear"} camera) - switch failed, reverted`);
+        } catch (fallbackErr) {
+            console.error("Fallback camera also failed:", fallbackErr.message);
+            setStatus("Camera unavailable: " + fallbackErr.message);
+        }
+        return;
+    }
+
+    const newVideoTrack = newStream.getVideoTracks()[0];
+
+    // Swap the track on the WebRTC sender so the viewer's feed updates.
+    if (pc) {
+        const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+        if (sender) {
+            await sender.replaceTrack(newVideoTrack);
+            applyEncodingHints(sender, newVideoTrack);
+        }
+    }
+
+    localStream.addTrack(newVideoTrack);
+    videoEl.srcObject = localStream; // refresh local preview
+
+    currentFacingMode = facingMode;
+    setStatus(`Live (${facingMode === "user" ? "front" : "rear"} camera)`);
+}
+
+function applyEncodingHints(sender, track) {
+    track.contentHint = "motion";
+    const params = sender.getParameters();
+    if (!params.encodings) params.encodings = [{}];
+    params.encodings[0].maxBitrate = BITRATE_TARGET;
+    sender.setParameters(params).catch((e) =>
+        console.warn("Could not set bitrate params:", e.message)
+    );
+}
+
+async function createPeerConnection() {
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+    localStream.getTracks().forEach((track) => {
+        const sender = pc.addTrack(track, localStream);
+        if (track.kind === "video") {
+            applyEncodingHints(sender, track);
+        }
+    });
+
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            ws.send(JSON.stringify({ type: "ice-candidate", room: ROOM_ID, candidate: event.candidate }));
+        }
+    };
+
+    pc.onconnectionstatechange = () => {
+        setStatus("Connection state: " + pc.connectionState);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+        console.log("ICE connection state:", pc.iceConnectionState);
+        if (pc.iceConnectionState === "failed") {
+            setStatus("Connection failed - check TURN server / network");
+        }
+    };
+}
+
+async function requestWakeLock() {
+    try {
+        if ("wakeLock" in navigator) {
+            await navigator.wakeLock.request("screen");
+        }
+    } catch (e) {
+        console.log("Wake lock not available:", e.message);
+    }
+}
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") requestWakeLock();
+});
+
+// =====================================================================
+// USB MODE: direct control link to the ESP32 over a USB-OTG cable.
+//
+// This is a SEPARATE path from the WebRTC video stream above - video
+// still goes phone -> server -> viewer as always. Only pan/tilt/stop
+// commands switch transport: normally the server publishes them to
+// MQTT and the ESP32 hears them over WiFi; once this phone opens a
+// serial connection to the ESP32 here, the server instead forwards
+// each command to THIS page over the existing signaling WebSocket
+// (see "usb-command" in ws.onmessage above), and we write it straight
+// out the USB cable. The ESP32 fully disconnects from MQTT the moment
+// it sees "USBMODE:ON", so there's never a chance of the same command
+// double-arriving over both paths.
+//
+// TWO CONNECTION PATHS, tried in order:
+//  1. navigator.serial (the real Web Serial API) - works on desktop
+//     Chrome/Edge. On Android it may exist in the browser but list zero
+//     devices, because the underlying Android-level serial API it needs
+//     has only just started rolling out to a limited set of phones.
+//  2. WebUSB + Google's official "web-serial-polyfill" library - this
+//     re-implements the same open()/readable/writable interface on top
+//     of navigator.usb, which HAS been reliably available on Android
+//     for years. This is the path that actually works on most Android
+//     phones today. Loaded on demand via dynamic import() so desktop
+//     users (where path 1 just works) never pay for it.
+//
+// NOTE: even the polyfill path can occasionally fail with "Unable to
+// claim interface" on some phones - that specific error means Android's
+// own OS-level driver has already grabbed the USB chip before the
+// browser could, and no browser-based approach can get around that; it
+// would need a native Android app instead. Everything else fails with a
+// clearer "no port"/"not supported" message.
+//
+// requestPort()/requestDevice() below MUST be called from a real tap
+// (browser security requirement), which is why this is a button and not
+// something that runs automatically on page load.
+// =====================================================================
+
+const WEB_SERIAL_POLYFILL_URL = "https://esm.sh/web-serial-polyfill@1.0.15";
+
+const btnUsbEl = document.getElementById("btnUsb");
+const usbLogEl = document.getElementById("usbLog");
+
+const isAndroid = /Android/i.test(navigator.userAgent);
+// Preload the WebUSB serial polyfill as soon as the page loads, so by the
+// time you tap "Connect USB" nothing has to be downloaded/awaited before
+// requestPort() - any await in between can use up the tap's short-lived
+// "user gesture" and Chrome then refuses to show the device chooser.
+let polyfillSerial = null;
+import(WEB_SERIAL_POLYFILL_URL)
+    .then((m) => { polyfillSerial = m.serial; usbLog("USB helper loaded - ready."); })
+    .catch((e) => usbLog("USB helper failed to load: " + e.message));
+
+let nativeSerialFailed = isAndroid; // on Android, skip the Web Serial chooser (it lists nothing there) and go straight to WebUSB
+let serialPort = null;
+let serialWriter = null;
+let serialReader = null;
+let serialReadLoopActive = false;
+let usbConnected = false;
+let usbHeartbeatTimer = null;
+
+// ---- NATIVE (Flutter app) USB path ----
+// When this page runs inside the Phone Mount Bridge app, the app exposes
+// window.flutter_inappwebview.callHandler(...) and does the real USB serial
+// work with a native driver (works with CP2102/CH340, unlike WebUSB).
+// Looked up lazily at click time because the bridge object can appear a
+// moment after page load.
+let usingNative = false;
+function nativeBridge() {
+    const b = window.flutter_inappwebview;
+    return (b && typeof b.callHandler === "function") ? b : null;
+}
+
+// Called by the app with each line the ESP32 prints.
+window.onNativeUsbLine = function (line) { usbLog("ESP32: " + line); };
+
+// Called by the app if the cable is pulled / the port is lost.
+window.onNativeUsbDisconnected = function () {
+    if (!usbConnected) return;
+    usbLog("Cable unplugged - reverting to MQTT.");
+    if (usbHeartbeatTimer) { clearInterval(usbHeartbeatTimer); usbHeartbeatTimer = null; }
+    usingNative = false;
+    sendUsbStatus(false);
+    setUsbButtonState(false);
+};
+
+async function connectUsbNative(nb) {
+    try {
+        usbLog("Opening USB (native driver)...");
+        const res = await nb.callHandler("usbConnect");
+        if (!res || !res.ok) {
+            usbLog("Connect failed: " + ((res && res.message) || "unknown error"));
+            return;
+        }
+        usingNative = true;
+        // Opening the port can reset the ESP32 (DTR/RTS auto-reset). Give it
+        // time to boot before talking, or USBMODE:ON is lost in the reboot.
+        usbLog("Port open. Waiting 2.5s for the ESP32 to finish booting...");
+        await new Promise((r) => setTimeout(r, 2500));
+
+        await writeToUsb("USBMODE:ON");
+        usbLog("Sent USBMODE:ON to ESP32.");
+
+        sendUsbStatus(true);
+        setUsbButtonState(true);
+        usbLog("USB control ACTIVE - MQTT path now disabled on both ends.");
+
+        usbHeartbeatTimer = setInterval(() => { if (usbConnected) writeToUsb("PING"); }, 2000);
+    } catch (err) {
+        usbLog("Native connect error: " + err.message);
+        usingNative = false;
+    }
+}
+
+async function disconnectUsbNative(nb) {
+    usbLog("Disconnecting USB...");
+    if (usbHeartbeatTimer) { clearInterval(usbHeartbeatTimer); usbHeartbeatTimer = null; }
+    try { await writeToUsb("USBMODE:OFF"); } catch (e) {}
+    try { await nb.callHandler("usbDisconnect"); } catch (e) { usbLog("Port close error: " + e.message); }
+    usingNative = false;
+    sendUsbStatus(false);
+    setUsbButtonState(false);
+    usbLog("USB control OFF - back to MQTT/WiFi.");
+}
+
+function usbLog(line) {
+    console.log("[USB]", line);
+    if (!usbLogEl) return;
+    usbLogEl.classList.add("visible");
+    const row = document.createElement("div");
+    const t = new Date().toLocaleTimeString();
+    row.textContent = `${t}  ${line}`;
+    usbLogEl.appendChild(row);
+    // Cap history so this can't grow unbounded over a long session.
+    while (usbLogEl.children.length > 60) usbLogEl.removeChild(usbLogEl.firstChild);
+    usbLogEl.scrollTop = usbLogEl.scrollHeight;
+}
+
+function setUsbButtonState(connected) {
+    usbConnected = connected;
+    if (!btnUsbEl) return;
+    btnUsbEl.textContent = connected ? "USB Connected" : "Connect USB";
+    btnUsbEl.classList.toggle("connected", connected);
+}
+
+// Tells server.js whether this room should route commands to us over
+// USB (true) or keep using MQTT as normal (false).
+function sendUsbStatus(connected) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "usb-status", room: ROOM_ID, connected }));
+    } else {
+        usbLog("Warning: signaling not connected, server won't know about USB status yet.");
+    }
+}
+
+async function writeToUsb(payload) {
+    if (usingNative) {
+        const nb = nativeBridge();
+        if (nb) {
+            try { await nb.callHandler("usbWrite", payload + "\n"); }
+            catch (err) { usbLog("Write failed: " + err.message); }
+        }
+        return;
+    }
+    if (!serialWriter) return;
+    try {
+        await serialWriter.write(new TextEncoder().encode(payload + "\n"));
+    } catch (err) {
+        usbLog("Write failed: " + err.message);
+    }
+}
+
+// Continuously reads whatever the ESP32 prints back over Serial (its own
+// Serial.println log lines - MQTT status, "-> Pan target: ...", the
+// USBMODE ON/OFF banners, etc.) and shows it in the on-screen log, so you
+// can actually see the connection working instead of it being a black box.
+async function usbReadLoop(port) {
+    const reader = port.readable.getReader();
+    serialReader = reader; // stashed so disconnectUsb() can cancel this pending read
+    let lineBuffer = "";
+    serialReadLoopActive = true;
+    try {
+        while (serialReadLoopActive) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            lineBuffer += new TextDecoder().decode(value);
+            let idx;
+            while ((idx = lineBuffer.indexOf("\n")) !== -1) {
+                const line = lineBuffer.slice(0, idx).trim();
+                lineBuffer = lineBuffer.slice(idx + 1);
+                if (line.length > 0) usbLog("ESP32: " + line);
+            }
+        }
+    } catch (err) {
+        if (serialReadLoopActive) usbLog("Read loop error: " + err.message);
+    } finally {
+        try { reader.releaseLock(); } catch (e) {}
+        serialReader = null;
+    }
+}
+
+async function connectUsb() {
+    // Inside the Flutter app: use the native driver, skip all browser paths.
+    const nb = nativeBridge();
+    if (nb) { await connectUsbNative(nb); return; }
+
+    // Path 1: the real Web Serial API. Works outright on desktop; on
+    // Android it may exist but list no devices (see note above) - if so
+    // we fall through to the WebUSB polyfill below, remembering that for
+    // next time so we don't waste a click re-trying a path that's
+    // already shown it won't work on this phone.
+    if (!nativeSerialFailed && "serial" in navigator) {
+        try {
+            usbLog("Requesting USB device (Web Serial)...");
+            const port = await navigator.serial.requestPort();
+            await finishUsbConnect(port);
+            return;
+        } catch (err) {
+            usbLog("Web Serial found nothing (" + err.message + ") - trying WebUSB fallback...");
+            nativeSerialFailed = true;
+            // Falls through to path 2 below. NOTE: doing this within the
+            // same click/tap is usually fine (both calls are still
+            // inside the one user-gesture-triggered handler), but if
+            // your browser specifically complains the second prompt
+            // "isn't a user gesture", just tap Connect USB a second
+            // time - by then nativeSerialFailed is already set, so it
+            // will go straight to path 2 on that fresh tap.
+        }
+    }
+
+    // Path 2: WebUSB + Google's Serial API polyfill - the path that
+    // actually works on most Android phones today.
+    if (!polyfillSerial) {
+        usbLog("USB helper still loading - wait a second and tap again.");
+        return;
+    }
+    try {
+        usbLog("Requesting USB device (WebUSB)...");
+        // No await before this call, so the tap's user gesture is still valid.
+        const port = await polyfillSerial.requestPort();
+        await finishUsbConnect(port);
+    } catch (err) {
+        usbLog("Connect failed: " + err.message);
+        if (/claim interface/i.test(err.message)) {
+            usbLog("This specific error means Android's OS already grabbed this USB chip - no browser can get around that on this phone.");
+        }
+        serialPort = null;
+        serialWriter = null;
+    }
+}
+
+// Shared by both connection paths once we actually have an open-able
+// port object (either a real SerialPort or the polyfill's lookalike).
+async function finishUsbConnect(port) {
+    serialPort = port;
+
+    usbLog("Opening port at 115200 baud...");
+    await serialPort.open({ baudRate: 115200 });
+
+    serialWriter = serialPort.writable.getWriter();
+    usbReadLoop(serialPort); // fire-and-forget: runs until disconnectUsb()
+
+    // Tell the ESP32 first...
+    await writeToUsb("USBMODE:ON");
+    usbLog("Sent USBMODE:ON to ESP32.");
+
+    // ...then tell the server to start routing commands to us.
+    sendUsbStatus(true);
+    setUsbButtonState(true);
+    usbLog("USB control ACTIVE - MQTT path now disabled on both ends.");
+
+    // Heartbeat: the ESP32 auto-reverts to MQTT if it hears NOTHING
+    // over USB for 5s (its safety net for a yanked cable it can't
+    // otherwise detect). A real session can go quiet that long
+    // between drags, so keep it fed with a harmless ping it just
+    // logs and ignores.
+    usbHeartbeatTimer = setInterval(() => { if (usbConnected) writeToUsb("PING"); }, 2000);
+}
+
+async function disconnectUsb() {
+    if (usingNative) {
+        const nb = nativeBridge();
+        if (nb) { await disconnectUsbNative(nb); return; }
+    }
+    usbLog("Disconnecting USB...");
+
+    if (usbHeartbeatTimer) {
+        clearInterval(usbHeartbeatTimer);
+        usbHeartbeatTimer = null;
+    }
+
+    // Tell the ESP32 to go back to MQTT before we tear the port down.
+    try { await writeToUsb("USBMODE:OFF"); } catch (e) {}
+
+    serialReadLoopActive = false;
+
+    // MUST cancel the pending reader.read() before closing the port -
+    // otherwise close() hangs/throws because the readable stream is
+    // still locked by usbReadLoop's in-flight read.
+    try {
+        if (serialReader) await serialReader.cancel();
+    } catch (err) {
+        usbLog("Reader cancel error: " + err.message);
+    }
+
+    try {
+        if (serialWriter) {
+            await serialWriter.close();
+            serialWriter = null;
+        }
+    } catch (err) {
+        usbLog("Writer close error: " + err.message);
+    }
+
+    try {
+        if (serialPort) {
+            await serialPort.close();
+            serialPort = null;
+        }
+    } catch (err) {
+        usbLog("Port close error: " + err.message);
+    }
+
+    sendUsbStatus(false);
+    setUsbButtonState(false);
+    usbLog("USB control OFF - back to MQTT/WiFi.");
+}
+
+if (btnUsbEl) {
+    btnUsbEl.addEventListener("click", () => {
+        if (usbConnected) disconnectUsb();
+        else connectUsb();
+    });
+}
+
+// If the OTG cable is yanked physically, the browser fires this on the
+// navigator.serial object - catch it so the UI/server don't stay stuck
+// thinking USB is still active when it physically isn't anymore.
+if ("serial" in navigator) {
+    navigator.serial.addEventListener("disconnect", (event) => {
+        if (event.target === serialPort && usbConnected) {
+            usbLog("Cable unplugged - reverting to MQTT.");
+            if (usbHeartbeatTimer) { clearInterval(usbHeartbeatTimer); usbHeartbeatTimer = null; }
+            serialReadLoopActive = false;
+            if (serialReader) { try { serialReader.cancel(); } catch (e) {} }
+            serialReader = null;
+            serialPort = null;
+            serialWriter = null;
+            sendUsbStatus(false);
+            setUsbButtonState(false);
+        }
+    });
+}
+</script>
+
+</body>
+</html>
