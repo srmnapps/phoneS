@@ -34,11 +34,22 @@ jobs:
           cp device_filter.xml scaffold/android/app/src/main/res/xml/device_filter.xml
           python3 patch_manifest.py scaffold/android/app/src/main/AndroidManifest.xml
 
-      - name: Build release APK
+      - name: Get packages and patch plugins for new AGP
         working-directory: scaffold
         run: |
           flutter pub get
-          flutter build apk --release
+          # Newer AGP no longer supports 'proguard-android.txt' (it contains
+          # -dontoptimize, which blocks R8 optimizations). Patch any plugin
+          # in the pub cache that still uses it.
+          grep -rl --include='build.gradle*' "proguard-android.txt" "$HOME/.pub-cache/hosted" 2>/dev/null \
+            | while read -r f; do
+                echo "Patching $f"
+                sed -i "s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
+              done || true
+
+      - name: Build release APK
+        working-directory: scaffold
+        run: flutter build apk --release
 
       - uses: actions/upload-artifact@v4
         with:
